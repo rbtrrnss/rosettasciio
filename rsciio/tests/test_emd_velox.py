@@ -43,6 +43,17 @@ from rsciio.emd._api import is_EMD_Velox  # noqa: E402
 TEST_DATA_PATH = Path(__file__).parent / "data" / "emd"
 
 
+def _as_sequence(signals):
+    return signals if isinstance(signals, (list, tuple)) else [signals]
+
+
+def _get_eels_test_file():
+    eels_test_file = TEST_DATA_PATH / "example_eels.emd"
+    if eels_test_file.is_file():
+        return eels_test_file
+    pytest.skip("example_eels.emd test file not found")
+
+
 def _generate_parameters():
     parameters = []
     for lazy in [True, False]:
@@ -543,6 +554,50 @@ def test_velox_fft_odd_number(fname):
 
     assert s[1].axes_manager.signal_shape == (128, 128)
     assert np.issubdtype(s[1].data.dtype, float)
+
+
+@pytest.mark.parametrize("lazy", (False, True))
+def test_velox_eels_spectrum_image_loads(lazy):
+    """Ensure direct EELS SI cubes can be imported from Velox EMD files."""
+    filename = _get_eels_test_file()
+
+    signals = _as_sequence(hs.load(filename, lazy=lazy))
+    eels_signals = [
+        signal
+        for signal in signals
+        if getattr(signal.metadata.Signal, "signal_type", "") == "EELS"
+    ]
+
+    assert eels_signals, "No EELS signal found in loaded Velox file"
+
+    for signal in eels_signals:
+        if lazy and getattr(signal, "_lazy", False):
+            signal.compute(close_file=True)
+
+        assert isinstance(signal, hs.signals.Signal1D)
+        assert signal.data.ndim >= 2
+        assert signal.axes_manager[-1].name == "Electron energy loss"
+        assert signal.axes_manager[-1].navigate is False
+        assert signal.axes_manager[-1].size > 1
+        assert signal.axes_manager[-1].units in ("eV", "keV")
+
+        # Calibration fallback in the reader should guarantee a positive scale.
+        assert signal.axes_manager[-1].scale > 0
+
+
+@pytest.mark.parametrize("lazy", (False, True))
+def test_velox_eels_select_type_spectrum_image(lazy):
+    """Loading with select_type='spectrum_image' should still return EELS SI."""
+    filename = _get_eels_test_file()
+
+    signals = _as_sequence(hs.load(filename, select_type="spectrum_image", lazy=lazy))
+    eels_signals = [
+        signal
+        for signal in signals
+        if getattr(signal.metadata.Signal, "signal_type", "") == "EELS"
+    ]
+
+    assert eels_signals, "EELS signal missing when using select_type='spectrum_image'"
 
 
 class TestVeloxEMDv11:
