@@ -28,6 +28,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 
@@ -174,6 +175,11 @@ class FeiEMDReader(object):
             t2 = time.time()
             _logger.info("Time to load images: {} s.".format(t1 - t0))
             _logger.info("Time to load spectrum image: {} s.".format(t2 - t1))
+
+        # Velox files can also store direct EELS SI cubes under
+        # Data/EelsSpectrumImage/<UUID>/Data.
+        if select_type in (None, "spectrum_image"):
+            self._read_eels_spectrum_images()
 
     def _check_im_type(self):
         if "Image" in self.d_grp:
@@ -724,6 +730,225 @@ class FeiEMDReader(object):
 
         return 1, 0, None
 
+    def _read_eels_spectrum_images(self):
+        eels_group = self.d_grp.get("EelsSpectrumImage")
+        if eels_group is None:
+            eels_group = self.d_grp.get("EELSSpectrumImage")
+        if eels_group is None:
+            eels_group = self.d_grp.get("EELS")
+        if eels_group is None:
+            return
+
+        self.detector_name = "EELS"
+        _logger.info("Reading EELS spectrum image data.")
+
+        for i_window, eels_sub_group_key in enumerate(_get_keys_from_group(eels_group)):
+            eels_sub_group = eels_group[eels_sub_group_key]
+            if "Data" not in eels_sub_group:
+                continue
+
+            h5data = eels_sub_group["Data"]
+            if self.lazy:
+                import dask.array as da
+
+                data = da.from_array(h5data, chunks=h5data.chunks)
+            else:
+                data = h5data[:]
+
+            if data.ndim < 2:
+                _logger.warning(
+                    "Skipping EELS spectrum image '%s': expected at least 2D data.",
+                    eels_sub_group_key,
+                )
+                continue
+
+            # In SI cubes, the spectral axis is usually the longest one.
+            energy_axis = int(np.argmax(data.shape))
+            if self.lazy:
+                data = da.moveaxis(data, energy_axis, -1)
+            else:
+                data = np.moveaxis(data, energy_axis, -1)
+
+            try:
+                original_metadata = _parse_metadata(eels_group, eels_sub_group_key)
+            except Exception:
+                original_metadata = {}
+            original_metadata.update(self.original_metadata)
+
+            dispersion, offset, energy_unit = self._get_eels_dispersion_offset(
+                original_metadata, i_window
+            )
+
+            axes = []
+            nav_shape = data.shape[:-1]
+            for i, size in enumerate(nav_shape):
+                axes.append(
+                    {
+                        "index_in_array": i,
+                        "name": "y" if i == 0 else "x" if i == 1 else f"nav{i}",
+                        "offset": 0,
+                        "scale": 1,
+                        "size": size,
+                        "units": None,
+                        "navigate": True,
+                    }
+                )
+            axes.append(
+                {
+                    "index_in_array": data.ndim - 1,
+                    "name": "Electron energy loss",
+                    "offset": offset,
+                    "scale": dispersion,
+                    "size": data.shape[-1],
+                    "units": energy_unit,
+                    "navigate": False,
+                }
+            )
+
+            md = self._get_metadata_dict(original_metadata)
+            md["Signal"]["signal_type"] = "EELS"
+
+            self.dictionaries.append(
+                {
+                    "data": data,
+                    "axes": axes,
+                    "metadata": md,
+                    "original_metadata": original_metadata,
+                    "mapping": self._get_mapping(
+                        map_selected_element=False,
+                        parse_individual_EDS_detector_metadata=False,
+                    ),
+                }
+            )
+
+    def _get_eels_dispersion_offset(self, original_metadata, window_index=None):
+        # Keep robust defaults so data are importable when calibration keys vary.
+        dispersion = 1.0
+        offset = 0.0
+        unit = "eV"
+
+        cp = original_metadata.get("CustomProperties", {})
+        if isinstance(cp, dict) and window_index is not None:
+            flat_disp_key = (
+                f"AnalyticalDetector[EELS].SpectrumDispersion[{window_index}]"
+            )
+            flat_off_key = (
+                f"AnalyticalDetector[EELS].SpectrumOffsetEnergy[{window_index}]"
+            )
+
+            def _value_from_entry(entry):
+                if isinstance(entry, dict) and "value" in entry:
+                    return entry["value"]
+                return entry
+
+            found = False
+            try:
+                if flat_disp_key in cp:
+                    dispersion = float(_value_from_entry(cp[flat_disp_key]))
+                    found = True
+                if flat_off_key in cp:
+                    offset = float(_value_from_entry(cp[flat_off_key]))
+                    found = True
+                if found:
+                    return dispersion, offset, unit
+            except (TypeError, ValueError):
+                pass
+
+            eels_cp = cp.get("AnalyticalDetector[EELS]", {})
+            if isinstance(eels_cp, dict):
+                nested_disp_key = f"SpectrumDispersion[{window_index}]"
+                nested_off_key = f"SpectrumOffsetEnergy[{window_index}]"
+                found = False
+                try:
+                    if nested_disp_key in eels_cp:
+                        dispersion = float(_value_from_entry(eels_cp[nested_disp_key]))
+                        found = True
+                    if nested_off_key in eels_cp:
+                        offset = float(_value_from_entry(eels_cp[nested_off_key]))
+                        found = True
+                    if found:
+                        return dispersion, offset, unit
+                except (TypeError, ValueError):
+                    pass
+
+            disp_values = {}
+            off_values = {}
+            for key, value in cp.items():
+                match_disp = re.match(
+                    r"^AnalyticalDetector\[EELS\]\.SpectrumDispersion\[(\d+)\]$",
+                    key,
+                )
+                if match_disp:
+                    try:
+                        disp_values[int(match_disp.group(1))] = float(
+                            _value_from_entry(value)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                match_off = re.match(
+                    r"^AnalyticalDetector\[EELS\]\.SpectrumOffsetEnergy\[(\d+)\]$",
+                    key,
+                )
+                if match_off:
+                    try:
+                        off_values[int(match_off.group(1))] = float(
+                            _value_from_entry(value)
+                        )
+                    except (TypeError, ValueError):
+                        pass
+
+            if disp_values or off_values:
+                indices = sorted(set(disp_values) | set(off_values))
+                if window_index < len(indices):
+                    idx = indices[window_index]
+                    dispersion = disp_values.get(idx, dispersion)
+                    offset = off_values.get(idx, offset)
+                    return dispersion, offset, unit
+
+        def _iter_dict_values(d):
+            if isinstance(d, dict):
+                for key, value in d.items():
+                    yield key, value
+                    yield from _iter_dict_values(value)
+
+        candidate_scale_keys = (
+            "Dispersion",
+            "EnergyStep",
+            "ChannelWidth",
+            "EnergyDispersion",
+        )
+        candidate_offset_keys = ("OffsetEnergy", "EnergyOffset", "ZeroLoss")
+        candidate_unit_keys = ("EnergyUnit", "Unit", "Units")
+
+        for key, value in _iter_dict_values(original_metadata):
+            if key in candidate_scale_keys:
+                try:
+                    dispersion = float(value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+        for key, value in _iter_dict_values(original_metadata):
+            if key in candidate_offset_keys:
+                try:
+                    offset = float(value)
+                    break
+                except (TypeError, ValueError):
+                    continue
+
+        for key, value in _iter_dict_values(original_metadata):
+            if key in candidate_unit_keys and isinstance(value, str):
+                if value.strip():
+                    unit = value.strip()
+                    break
+
+        if unit.lower() in ("kev", "kiloelectronvolt", "kiloelectronvolts"):
+            dispersion *= 1000.0
+            offset *= 1000.0
+            unit = "eV"
+
+        return dispersion, offset, unit
+
     def _convert_scale_units(self, value, units, factor=1):
         if units is None:
             return value, units
@@ -889,7 +1114,7 @@ class FeiEMDReader(object):
 
 # Below some information we have got from FEI about the format of the stream:
 #
-# The SI data is stored as a spectrum stream, ‘65535’ means next pixel
+# The SI data is stored as a spectrum stream, â€˜65535â€™ means next pixel
 # (these markers are also called `Gate pulse`), other numbers mean a spectrum
 # count in that bin for that pixel.
 # For the size of the spectrum image and dispersion you have to look in
